@@ -1,210 +1,293 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use anchor_spl::associated_token::AssociatedToken;
 
-declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
+// Program ID and constants
+declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLaS");
+const JUPITER_PROGRAM_ID: Pubkey = pubkey!("JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk");
+const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
-/// Jupiter program ID on mainnet
-pub const JUPITER_PROGRAM_ID: Pubkey = pubkey!("JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk");
-
-/// USDC mint address on mainnet
-pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-
-/// Custom errors for the swap program
-#[error_code]
-pub enum SwapError {
-    #[msg("Invalid admin address")]
-    InvalidAdmin,
-    #[msg("Invalid referral address")]
-    InvalidReferral,
-    #[msg("Invalid amount")]
-    InvalidAmount,
-    #[msg("Invalid minimum output amount")]
-    InvalidMinOutAmount,
-    #[msg("Commission calculation overflow")]
-    CommissionOverflow,
-    #[msg("Slippage tolerance exceeded")]
-    SlippageExceeded,
-    #[msg("Jupiter swap failed")]
-    JupiterSwapFailed,
-    #[msg("Invalid Jupiter route")]
-    InvalidJupiterRoute,
-    #[msg("Insufficient balance")]
-    InsufficientBalance,
-    #[msg("Invalid token account")]
-    InvalidTokenAccount,
-}
+// Commission shares
+const REFERRAL_SHARE_NUM: u64 = 4;
+const ADMIN_SHARE_NUM:    u64 = 6;
+const SHARE_DENOM:        u64 = 10;
 
 #[program]
 pub mod swap {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>, admin: Pubkey, referral: Pubkey) -> Result<()> {
-        require_keys_eq!(admin, ctx.accounts.admin.key(), SwapError::InvalidAdmin);
-        require_keys_eq!(referral, ctx.accounts.referral.key(), SwapError::InvalidReferral);
-        let swap_account = &mut ctx.accounts.swap_account;
-        swap_account.admin = admin;
-        swap_account.referral = referral;
+    /// Initialize the swap account, storing admin, referral, and bump
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        admin:   Pubkey,
+        referral: Pubkey,
+    ) -> Result<()> {
+        require_keys_neq!(admin, referral, SwapError::InvalidInput);
+        let swap_acc = &mut ctx.accounts.swap_account;
+        swap_acc.admin    = admin;
+        swap_acc.referral = referral;
+        swap_acc.bump     = *ctx.bumps.get("swap_account").unwrap();
         Ok(())
     }
 
+    /// Execute token swap with 1% commission, split between referral and admin
     pub fn swap_tokens(
         ctx: Context<SwapTokens>,
-        input_amount: u64,
+        input_amount:     u64,
         min_output_amount: u64,
-        route_data: Vec<u8>,
     ) -> Result<()> {
-        // Validate input and route
-        require_gt!(input_amount, 0, SwapError::InvalidAmount);
-        require_gt!(min_output_amount, 0, SwapError::InvalidMinOutAmount);
-        require_keys_eq!(ctx.accounts.jupiter_program.key(), JUPITER_PROGRAM_ID, SwapError::InvalidJupiterRoute);
-        require_keys_eq!(ctx.accounts.usdc_mint.key(), USDC_MINT, SwapError::InvalidJupiterRoute);
+        // Basic input validation
+        require!(input_amount > 0 && min_output_amount > 0, SwapError::InvalidInput);
+        let user_in = &ctx.accounts.user_token_in_account;
+        require!(user_in.amount >= input_amount, SwapError::InsufficientBalance);
 
-        // Commission calculation
-        let commission = (input_amount as u128)
-            .checked_mul(1)
-            .and_then(|v| v.checked_div(100))
-            .ok_or(SwapError::CommissionOverflow)? as u64;
-        let amount_after = input_amount.checked_sub(commission).ok_or(SwapError::CommissionOverflow)?;
+        // Calculate 1% commission
+        let commission = input_amount
+            .checked_div(100)
+            .ok_or(SwapError::Overflow)?;
+        let amount_after = input_amount
+            .checked_sub(commission)
+            .ok_or(SwapError::Overflow)?;
 
-        // Transfer input tokens to program account
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.user_token_account.to_account_info(),
-                    to: ctx.accounts.swap_token_account.to_account_info(),
-                    authority: ctx.accounts.user.to_account_info(),
-                },
-            ),
-            input_amount,
-        )?;
+        // PDA seeds for signing
+        let signer_seeds = &[&[b"swap", &[ctx.accounts.swap_account.bump]]];
 
-        // User swap via Jupiter CPI
-        let swap_ix = Instruction {
-            program_id: JUPITER_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.swap_token_account.key(), false),
-                AccountMeta::new(ctx.accounts.user_sol_account.key(), false),
-                AccountMeta::new(ctx.accounts.user.key(), true),
-                AccountMeta::new(ctx.accounts.token_program.key(), false),
-                AccountMeta::new(ctx.accounts.system_program.key(), false),
-                AccountMeta::new_readonly(JUPITER_PROGRAM_ID, false),
-                AccountMeta::new_readonly(ctx.accounts.jupiter_route.key(), false),
-            ],
-            data: route_data.clone(),
-        };
-        anchor_lang::solana_program::program::invoke(
-            &swap_ix,
-            &[
-                ctx.accounts.swap_token_account.to_account_info(),
-                ctx.accounts.user_sol_account.to_account_info(),
-                ctx.accounts.user.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-                ctx.accounts.jupiter_program.to_account_info(),
-                ctx.accounts.jupiter_route.to_account_info(),
-            ],
-        )?;
+        // 1) Main swap for user via Jupiter CPI
+        let cpi_swap_ctx = CpiContext::new_with_signer(
+            ctx.accounts.jupiter_program.to_account_info(),
+            jupiter_cpi::accounts::JupiterSwap {
+                swap_in:   ctx.accounts.swap_token_in_account.to_account_info(),
+                swap_out:  ctx.accounts.user_token_out_account.to_account_info(),
+                authority: ctx.accounts.swap_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+            signer_seeds,
+        );
+        jupiter_cpi::cpi::swap(cpi_swap_ctx, amount_after, min_output_amount)?;
 
-        // Slippage check
-        let sol_balance = ctx.accounts.user_sol_account.lamports();
-        require_gte!(sol_balance, min_output_amount, SwapError::SlippageExceeded);
+        // 2) Swap commission portion into USDC via Jupiter CPI
+        let cpi_comm_ctx = CpiContext::new_with_signer(
+            ctx.accounts.jupiter_program.to_account_info(),
+            jupiter_cpi::accounts::JupiterSwap {
+                swap_in:   ctx.accounts.swap_token_in_account.to_account_info(),
+                swap_out:  ctx.accounts.commission_usdc_account.to_account_info(),
+                authority: ctx.accounts.swap_account.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+            signer_seeds,
+        );
+        jupiter_cpi::cpi::swap(cpi_comm_ctx, commission, 0)?;
 
-        // Commission swap via Jupiter CPI
-        let commission_ix = Instruction {
-            program_id: JUPITER_PROGRAM_ID,
-            accounts: vec![
-                AccountMeta::new(ctx.accounts.swap_token_account.key(), false),
-                AccountMeta::new(ctx.accounts.commission_usdc_account.key(), false),
-                AccountMeta::new(ctx.accounts.swap_account.key(), true),
-                AccountMeta::new(ctx.accounts.token_program.key(), false),
-                AccountMeta::new(ctx.accounts.system_program.key(), false),
-                AccountMeta::new_readonly(JUPITER_PROGRAM_ID, false),
-                AccountMeta::new_readonly(ctx.accounts.jupiter_route.key(), false),
-            ],
-            data: route_data,
-        };
-        anchor_lang::solana_program::program::invoke_signed(
-            &commission_ix,
-            &[
-                ctx.accounts.swap_token_account.to_account_info(),
-                ctx.accounts.commission_usdc_account.to_account_info(),
-                ctx.accounts.swap_account.to_account_info(),
-                ctx.accounts.token_program.to_account_info(),
-                ctx.accounts.system_program.to_account_info(),
-                ctx.accounts.jupiter_program.to_account_info(),
-                ctx.accounts.jupiter_route.to_account_info(),
-            ],
-            &[&[b"swap", &[ctx.bumps["swap_account"].clone()]]],
-        )?;
+        // 3) Distribute USDC to referral (40%) and admin (60%)
+        let total_usdc       = ctx.accounts.commission_usdc_account.amount;
+        let referral_amount  = share(total_usdc, REFERRAL_SHARE_NUM, SHARE_DENOM)?;
+        let admin_amount     = total_usdc.checked_sub(referral_amount).ok_or(SwapError::Overflow)?;
 
-        // Distribute USDC commission
-        let usdc_amount = ctx.accounts.commission_usdc_account.amount;
-        let referral_amt = (usdc_amount as u128).checked_mul(40).and_then(|v| v.checked_div(100)).ok_or(SwapError::CommissionOverflow)? as u64;
-        let admin_amt = usdc_amount.checked_sub(referral_amt).ok_or(SwapError::CommissionOverflow)?;
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.commission_usdc_account.to_account_info(),
-                    to: ctx.accounts.referral_usdc_account.to_account_info(),
-                    authority: ctx.accounts.swap_account.to_account_info(),
-                },
-            ),
-            referral_amt,
-        )?;
-        token::transfer(
-            CpiContext::new(
-                ctx.accounts.token_program.to_account_info(),
-                token::Transfer {
-                    from: ctx.accounts.commission_usdc_account.to_account_info(),
-                    to: ctx.accounts.admin_usdc_account.to_account_info(),
-                    authority: ctx.accounts.swap_account.to_account_info(),
-                },
-            ),
-            admin_amt,
-        )?;
+        // Transfer to referral
+        let cpi_ref_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from:      ctx.accounts.commission_usdc_account.to_account_info(),
+                to:        ctx.accounts.referral_usdc_account.to_account_info(),
+                authority: ctx.accounts.swap_account.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token::transfer(cpi_ref_ctx, referral_amount)?;
+
+        // Transfer to admin
+        let cpi_admin_ctx = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from:      ctx.accounts.commission_usdc_account.to_account_info(),
+                to:        ctx.accounts.admin_usdc_account.to_account_info(),
+                authority: ctx.accounts.swap_account.to_account_info(),
+            },
+            signer_seeds,
+        );
+        token::transfer(cpi_admin_ctx, admin_amount)?;
 
         Ok(())
     }
 }
 
+// Accounts for initialization
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = admin, space = 8 + 32 + 32, seeds = [b"swap"], bump)]
-    pub swap_account: Account<'info, SwapState>,
-    #[account(mut)] pub admin: Signer<'info>,
-    #[account(mut)] pub referral: Signer<'info>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + 32 + 32 + 1, // discriminator + admin + referral + bump
+        seeds = [b"swap"],
+        bump
+    )]
+    pub swap_account: Account<'info, SwapAccount>,
+
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    /// CHECK: only stored in state
+    pub referral: UncheckedAccount<'info>,
+
     pub system_program: Program<'info, System>,
 }
 
+// Accounts for swap execution
 #[derive(Accounts)]
 pub struct SwapTokens<'info> {
-    #[account(mut, seeds = [b"swap"], bump)] pub swap_account: Account<'info, SwapState>,
-    #[account(mut)] pub user: Signer<'info>,
-    #[account(mut)] pub input_token_mint: Account<'info, Mint>,
-    #[account(mut, constraint = user_token_account.mint == input_token_mint.key(), constraint = user_token_account.owner == user.key())]
-    pub user_token_account: Account<'info, TokenAccount>,
-    #[account(mut, associated_token::mint = input_token_mint, associated_token::authority = swap_account)]
-    pub swap_token_account: Account<'info, TokenAccount>,
-    #[account(mut, associated_token::mint = USDC_MINT, associated_token::authority = swap_account)]
+    #[account(
+        mut,
+        seeds = [b"swap"],
+        bump = swap_account.bump
+    )]
+    pub swap_account: Account<'info, SwapAccount>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    pub token_in_mint: Account<'info, Mint>,
+    pub token_out_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = user_token_in_account.mint == token_in_mint.key() &&
+                     user_token_in_account.owner == user.key()
+    )]
+    pub user_token_in_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = user_token_out_account.mint == token_out_mint.key() &&
+                     user_token_out_account.owner == user.key()
+    )]
+    pub user_token_out_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = token_in_mint,
+        associated_token::authority = swap_account
+    )]
+    pub swap_token_in_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        associated_token::mint = USDC_MINT,
+        associated_token::authority = swap_account
+    )]
     pub commission_usdc_account: Account<'info, TokenAccount>,
-    #[account(mut, associated_token::mint = USDC_MINT, associated_token::authority = referral.key())]
+
+    #[account(
+        mut,
+        associated_token::mint = USDC_MINT,
+        associated_token::authority = swap_account.referral
+    )]
     pub referral_usdc_account: Account<'info, TokenAccount>,
-    #[account(mut, associated_token::mint = USDC_MINT, associated_token::authority = admin.key())]
+
+    #[account(
+        mut,
+        associated_token::mint = USDC_MINT,
+        associated_token::authority = swap_account.admin
+    )]
     pub admin_usdc_account: Account<'info, TokenAccount>,
-    #[account(constraint = jupiter_program.key() == JUPITER_PROGRAM_ID)] pub jupiter_program: Program<'info, System>,
-    pub jupiter_route: AccountInfo<'info>,
-    #[account(mut)] pub user_sol_account: AccountInfo<'info>,
+
+    #[account(constraint = usdc_mint.key() == USDC_MINT)]
+    pub usdc_mint: Account<'info, Mint>,
+
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
-    pub usdc_mint: Account<'info, Mint>,
+
+    pub jupiter_program: Program<'info, Any>,
+
+    /// CHECK: Jupiter route not validated by Anchor
+    pub jupiter_route: UncheckedAccount<'info>,
 }
 
+// State for swap account
 #[account]
-pub struct SwapState {
-    pub admin: Pubkey,
+pub struct SwapAccount {
+    pub admin:    Pubkey,
     pub referral: Pubkey,
+    pub bump:     u8,
+}
+
+// Helper to calculate shares safely
+fn share(amount: u64, num: u64, den: u64) -> Result<u64> {
+    amount.checked_mul(num)
+        .and_then(|v| v.checked_div(den))
+        .ok_or(SwapError::Overflow)
+}
+
+// Custom error codes
+#[error_code]
+pub enum SwapError {
+    #[msg("Invalid input")]
+    InvalidInput,
+    #[msg("Overflow")]
+    Overflow,
+    #[msg("Insufficient balance")]
+    InsufficientBalance,
+}
+
+// CPI wrapper for Jupiter Program
+pub mod jupiter_cpi {
+    use super::*;
+    use anchor_lang::solana_program::{
+        instruction::{AccountMeta, Instruction},
+        program::invoke_signed,
+    };
+
+    pub mod cpi {
+        use super::*;
+
+        /// Perform a token swap via Jupiter
+        pub fn swap<'info>(
+            ctx: CpiContext<'_, '_, '_, 'info, accounts::JupiterSwap<'info>>,
+            amount_in:  u64,
+            minimum_out: u64,
+        ) -> Result<()> {
+            let ix = Instruction {
+                program_id: ctx.program.key(),
+                accounts: vec![
+                    AccountMeta::new(ctx.accounts.swap_in.key(), false),
+                    AccountMeta::new(ctx.accounts.swap_out.key(), false),
+                    AccountMeta::new_readonly(ctx.accounts.authority.key(), true),
+                    AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
+                ],
+                data: {
+                    let mut buf = Vec::with_capacity(1 + 8 + 8);
+                    buf.push(0u8);
+                    buf.extend_from_slice(&amount_in.to_le_bytes());
+                    buf.extend_from_slice(&minimum_out.to_le_bytes());
+                    buf
+                },
+            };
+            invoke_signed(
+                &ix,
+                &[
+                    ctx.accounts.swap_in.to_account_info(),
+                    ctx.accounts.swap_out.to_account_info(),
+                    ctx.accounts.authority.to_account_info(),
+                    ctx.accounts.token_program.to_account_info(),
+                ],
+                ctx.signer_seeds,
+            )?;
+            Ok(())
+        }
+    }
+
+    pub mod accounts {
+        use super::*;
+
+        #[derive(Accounts)]
+        pub struct JupiterSwap<'info> {
+            #[account(mut)]
+            pub swap_in:   Account<'info, TokenAccount>,
+            #[account(mut)]
+            pub swap_out:  Account<'info, TokenAccount>,
+            /// CHECK: PDA authority signing
+            pub authority: AccountInfo<'info>,
+            pub token_program: Program<'info, Token>,
+        }
+    }
 }

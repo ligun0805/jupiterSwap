@@ -1,5 +1,5 @@
 {
-  "name": "buyanytoken_contracts_solana",
+  "name": "swap",
   "version": "0.1.0",
   "description": "Solana swap program",
   "main": "index.js",

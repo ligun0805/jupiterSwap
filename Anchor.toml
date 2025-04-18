@@ -20,11 +20,16 @@ swap = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
 jupiter = "JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk"
 usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
+[programs.devnet]
+swap = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+jupiter = "JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk"
+usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "Testnet"
+cluster = "Devnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

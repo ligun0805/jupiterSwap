@@ -4,7 +4,7 @@ import { Swap } from "../target/types/swap";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 
 // Set mainnet RPC URL
-process.env.ANCHOR_PROVIDER_URL = "https://api.mainnet-beta.solana.com";
+process.env.ANCHOR_PROVIDER_URL = "https://api.devnet.solana.com";
 
 // Constants
 const JUPITER_PROGRAM_ID = new anchor.web3.PublicKey("JUP6i4ozu5ydDCnLiMogSckDPpbtr7BJ4FtzYWkb5Rk");
